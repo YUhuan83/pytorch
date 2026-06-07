@@ -1,0 +1,157 @@
+'''fine——tuning即微调，是利用pytorch中别人已经训练好的模型进行微调，以适应自己的数据的方法，大幅降低造轮子的时间，同时在自己数据集较少的情况下可以显著避免过拟合
+一般来说，我们只对模型的一些层进行微调，下面是一些注意事项
+1.新数据集和原始数据集合类似，那么直接可以微调一个最后的FC层或者重新指定一个新的分类器
+2.新数据集比较小和原始数据集合差异性比较大，那么可以使用从模型的中部开始训练，只对最后几层进行fine-tuning
+3.新数据集的大小一定要与原始数据集相同，比如CNN中输入的图片大小一定要相同，才不会报错
+4.如果数据集大小不同的话，可以在最后的fc层之前添加卷积或者pool层，使得最后的输出与fc层一致，但这样会导致准确度大幅下降，所以不建议这样做
+5.对于不同的层可以设置不同的学习率，一般情况下建议，对于使用的原始数据做初始化的层设置的学习率要小于（一般可设置小于10倍）初始化的学习率，这样保证对于已经初始化的数据不会扭曲的过快，而使用初始化学习率的新层可以快速的收敛。
+
+下面是一些具体的流程，具体到每一步的可以看下文注释
+1.确定数据集特点:本次使用的就是kaggle上的dog breed数据集，我们需要将种类与数字挂钩，即编号，才能使用数据
+2.自定义数据集：由于提供的数据集不一定符合所使用的模型的格式，我们需要自己创造一个数据集的外壳(内核还是我们之前的数据集)，定义好其中的方法(这些方法一般不用记)
+3.定义超参数：图片的大小，一批次的数量，均值方差，设备的选择等(这一步也可以放前面)
+4.定义训练集和测试集的图片处理方式,为了提高训练效果，我们在训练集的处理中，更希望图片能够舍弃掉一些无用特征，比如本题中的角度，上下等，而着重观察重要特征，如鼻子，耳朵等。拆分好测试集训练集
+5.用dataloader载入数据，注意要为训练集和测试集都配备好dataloader，将两者打包到一个字典，便于传输使用
+6.下载官方模型，这里要注意固定好不需要修改的层的参数，在微调过程中，只有我们自己重定义的层的参数是可改的
+7.配置损失函数，更新参数方法，定义训练函数，定义测试函数(老几样，每个神经网络都有的)
+8.实例化并用epoch法检验
+'''
+import time  # 在文件开头导入 time 模块
+import torch,os,torchvision
+import torch.nn as nn
+import torch.nn.functional as F
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, Dataset
+from torchvision import datasets, models, transforms
+from PIL import Image
+from sklearn.model_selection import StratifiedShuffleSplit
+torch.__version__
+DATA_ROOT = r"D:\data"
+all_labels_df = pd.read_csv(os.path.join(DATA_ROOT,'labels.csv'))#解压一个本地文件，这个文件里面只有文件名和类别，并没有真正的数据
+all_labels_df.head()
+breeds = all_labels_df.breed.unique()#创立一个字典用来存储独特的犬种名称
+breed2idx = dict((breed,idx) for idx,breed in enumerate(breeds))#建立另一个字典，用enumerate建立用犬种到数字的映射
+idx2breed = dict((idx,breed) for idx,breed in enumerate(breeds))#还原操作，从数字变回犬种
+len(breeds)#计算犬种个数
+all_labels_df['label_idx'] = [breed2idx[b] for b in all_labels_df.breed]
+all_labels_df.head()#在python内存中为csv文件编号原本只有文件名和类别现在加上了犬种名对应的数字，但是本地文件中没有改变
+#下面要定义符合resnet规范的数据集以便于传入训练
+class DogDataset(Dataset):
+    def __init__(self, labels_df, img_path, transform=None):#默认不对图片处理即为None
+        self.labels_df = labels_df
+        self.img_path = img_path
+        self.transform = transform
+
+    def __len__(self):
+        return self.labels_df.shape[0]#计算出有多少张图片
+
+    def __getitem__(self, idx):
+        image_name = os.path.join(self.img_path, self.labels_df.id[idx]) + '.jpg'#join方法将文件路径，标签，后缀jpg连接在一起
+        img = Image.open(image_name)#在内存里打开图片
+        label = self.labels_df.label_idx[idx]#获取图片的标签
+
+        if self.transform:#如果有transform要求就执行transform
+            img = self.transform(img)
+        return img, label#返回1个元组，即图片和对应标签
+IMG_SIZE = 224 # resnet50的输入是224的所以需要将图片统一大小
+BATCH_SIZE= 256 #这个批次大小需要占用4.6-5g的显存，如果不够的化可以改下批次，如果内存超过10G可以改为512
+IMG_MEAN = [0.485, 0.456, 0.406]
+IMG_STD = [0.229, 0.224, 0.225]
+CUDA=torch.cuda.is_available()
+DEVICE = torch.device("cuda" if CUDA else "cpu")
+#下面是对于训练集测试集的操作
+train_transforms = transforms.Compose([#是为了提高训练集的效果，才对训练集的图片有这么多的操作
+    transforms.Resize(IMG_SIZE),#将短边缩放
+    transforms.RandomResizedCrop(IMG_SIZE),#强制随机截取部分图片，使机器学习到鼻子眼睛等具体特征
+    transforms.RandomHorizontalFlip(),#随机水平翻转，使得对方向脱敏
+    transforms.RandomRotation(30),#随机旋转
+    transforms.ToTensor(),#转化为张量
+    transforms.Normalize(IMG_MEAN, IMG_STD)#标准化
+])
+
+val_transforms = transforms.Compose([
+    transforms.Resize(IMG_SIZE),#缩放
+    transforms.CenterCrop(IMG_SIZE),#裁剪中心部分
+    transforms.ToTensor(),#转换张量
+    transforms.Normalize(IMG_MEAN, IMG_STD)
+])
+dataset_names = ['train', 'valid']
+stratified_split = StratifiedShuffleSplit(n_splits=1, test_size=0.1, random_state=0)#初始化测试集只占百分之十，固定种子便于复现
+train_split_idx, val_split_idx = next(iter(stratified_split.split(all_labels_df.id, all_labels_df.breed)))#分层划分，将犬种均匀分布到训练集和测试集
+train_df = all_labels_df.iloc[train_split_idx].reset_index()#从原始数据中分出训练集，并且将训练集的索引重置为标准(因为随机分，所以索引可以不从零且不连续)
+val_df = all_labels_df.iloc[val_split_idx].reset_index()
+print(len(train_df))
+print(len(val_df))#检验是否为9：1分
+
+image_transforms = {'train':train_transforms, 'valid':val_transforms}#前面定义了训练集和测试集的处理方法，现在用字典定义，到时候可以直接应用方法
+
+train_dataset = DogDataset(train_df, os.path.join(DATA_ROOT,'train'), transform=image_transforms['train'])#创建实例
+val_dataset = DogDataset(val_df, os.path.join(DATA_ROOT,'train'), transform=image_transforms['valid'])#创建实例
+image_dataset = {'train':train_dataset, 'valid':val_dataset}#将创建的两个实例打包进一个字典
+
+image_dataloader = {x:DataLoader(image_dataset[x],batch_size=BATCH_SIZE,shuffle=True,num_workers=0) for x in dataset_names}#同时为训练集和数据集创建了dataloader。
+dataset_sizes = {x:len(image_dataset[x]) for x in dataset_names}#记录数据集大小
+
+model_ft = models.resnet50(weights='IMAGENET1K_V1') # 下载已经训练好的牛逼克拉斯模型
+# 将所有的参数层进行冻结，这样不用处理庞大参数，也不会出现过拟合
+for param in model_ft.parameters():
+    param.requires_grad = False
+# 这里打印下全连接层的信息
+print(model_ft.fc)
+num_fc_ftr = model_ft.fc.in_features #获取到fc层的输入，因为我们将会换掉fc层(原来的fc是有1000种输出，但是我们只有120种狗)
+model_ft.fc = nn.Linear(num_fc_ftr, len(breeds)) # 定义一个新的FC层(一个可以输出120种品类的fc层)，注意我们实际上只改变了最后一层，神经网络前面所有都没有改变，他们的参数也不能改变，只有最后我们自己写的这个fc可以训练
+model_ft=model_ft.to(DEVICE)# 放到设备中
+print(model_ft) # 最后再打印一下新的模型
+#损失函数定义
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam([
+    {'params':model_ft.fc.parameters()}
+], lr=0.001)#指定 新加的fc层的学习率
+#司空见惯的定义训练集数据集操作
+def train(model,device, train_loader, epoch):
+    model.train()
+    for batch_idx, data in enumerate(train_loader):
+        x,y= data
+        x=x.to(device)
+        y=y.to(device)
+        optimizer.zero_grad()
+        y_hat= model(x)
+        loss = criterion(y_hat, y)
+        loss.backward()
+        optimizer.step()
+    print ('Train Epoch: {}\t Loss: {:.6f}'.format(epoch,loss.item()))
+def test(model, device, test_loader):
+    model.eval()
+    test_loss = 0
+    correct = 0
+    with torch.no_grad():
+        for i,data in enumerate(test_loader):
+            x,y= data
+            x=x.to(device)
+            y=y.to(device)
+            optimizer.zero_grad()
+            y_hat = model(x)
+            test_loss += criterion(y_hat, y).item() * x.size(0)  # 累加总 Loss
+            # ...
+            test_loss /= len(test_loader.dataset)  # 这样除以总图片数才是对的
+            pred = y_hat.max(1, keepdim=True)[1] # get the index of the max log-probability
+            correct += pred.eq(y.view_as(pred)).sum().item()
+    test_loss /= len(test_loader.dataset)
+    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+        test_loss, correct, len(val_dataset),
+        100. * correct / len(val_dataset)))
+for epoch in range(1, 10):
+    # 记录开始时间
+    start_time = time.perf_counter()
+
+    # 执行训练
+    train(model=model_ft, device=DEVICE, train_loader=image_dataloader["train"], epoch=epoch)
+
+    # 执行验证
+    test(model=model_ft, device=DEVICE, test_loader=image_dataloader["valid"])
+
+    # 计算并打印耗时
+    end_time = time.perf_counter()
+    print(f"Epoch {epoch} 总耗时: {round(end_time - start_time, 3)} 秒")
