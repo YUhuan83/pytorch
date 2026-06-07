@@ -1,0 +1,161 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from matplotlib import pyplot as plt
+
+# ================= 1. 超参数与设备设置 =================
+TIME_STEP = 20        # RNN 每次看到的序列长度
+INPUT_SIZE = 1        # rnn 的输入维度
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+H_SIZE = 64           # 隐藏单元数（加大到 64，增强表达能力）
+NUM_LAYERS = 2        # 两层 RNN 堆叠，更深能学到更复杂的时序模式
+EPOCHS = 400          # 增加训练轮数
+BATCH_SIZE = 32
+LEARNING_RATE = 0.003
+
+# ================= 2. 生成训练与测试数据 =================
+train_steps = np.linspace(0, np.pi * 10, 2000, dtype=np.float32)
+test_steps  = np.linspace(np.pi * 10, np.pi * 12, 400, dtype=np.float32)
+
+train_sin = np.sin(train_steps)
+train_cos = np.cos(train_steps)
+test_sin  = np.sin(test_steps)
+test_cos  = np.cos(test_steps)
+
+
+def make_windows(sin_arr, cos_arr, window_size, stride=None):
+    """滑动窗口切割长序列为 (N, window_size, 1) 的训练样本"""
+    if stride is None:
+        stride = max(1, window_size // 2)
+    X, Y = [], []
+    for i in range(0, len(sin_arr) - window_size, stride):
+        X.append(sin_arr[i:i + window_size])
+        Y.append(cos_arr[i:i + window_size])
+    X = np.stack(X)
+    Y = np.stack(Y)
+    return X[..., np.newaxis], Y[..., np.newaxis]
+
+
+X_train, Y_train = make_windows(train_sin, train_cos, TIME_STEP)
+X_test,  Y_test  = make_windows(test_sin,  test_cos,  TIME_STEP)
+
+print(f'Train samples: {len(X_train)}, Test samples: {len(X_test)}')
+print(f'X_train shape: {X_train.shape}')
+
+
+# ================= 3. 定义 RNN 模型（2层堆叠） =================
+class RNN(nn.Module):
+    def __init__(self):
+        super(RNN, self).__init__()
+        self.rnn = nn.RNN(
+            input_size=INPUT_SIZE,
+            hidden_size=H_SIZE,
+            num_layers=NUM_LAYERS,       # 2 层 RNN
+            batch_first=True,
+            nonlinearity='tanh',
+            dropout=0.0,                 # 层间 dropout（num_layers>1 时可用）
+        )
+        self.out = nn.Linear(H_SIZE, INPUT_SIZE)
+
+    def forward(self, x, h_state=None):
+        r_out, h_state = self.rnn(x, h_state)
+        outs = self.out(r_out.reshape(-1, H_SIZE))
+        outs = outs.view(r_out.size(0), r_out.size(1), -1)
+        return outs, h_state
+
+
+# ================= 4. 初始化 =================
+rnn = RNN().to(DEVICE)
+optimizer = optim.Adam(rnn.parameters(), lr=LEARNING_RATE)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='min', factor=0.5, patience=30
+)
+criterion = nn.MSELoss()
+rnn.train()
+
+# ================= 5. 训练循环 =================
+plt.ion()
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+fig.suptitle('RNN: sin -> cos', fontsize=14)
+
+# 固定测试序列用于可视化（连续曲线更直观）
+test_steps_viz = test_steps[:200]
+x_test_viz = torch.from_numpy(
+    test_sin[:200][np.newaxis, :, np.newaxis]
+).to(DEVICE)
+y_test_viz = test_cos[:200]
+
+loss_history = []
+
+for epoch in range(EPOCHS):
+    # 打乱训练数据
+    perm = np.random.permutation(len(X_train))
+    X_shuffled = X_train[perm]
+    Y_shuffled = Y_train[perm]
+
+    epoch_loss = 0.0
+    n_batches = 0
+
+    for i in range(0, len(X_train), BATCH_SIZE):
+        batch_x = torch.from_numpy(X_shuffled[i:i + BATCH_SIZE]).to(DEVICE)
+        batch_y = torch.from_numpy(Y_shuffled[i:i + BATCH_SIZE]).to(DEVICE)
+
+        prediction, _ = rnn(batch_x)
+        loss = criterion(prediction, batch_y)
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(rnn.parameters(), max_norm=1.0)
+        optimizer.step()
+
+        epoch_loss += loss.item()
+        n_batches += 1
+
+    avg_loss = epoch_loss / n_batches
+    loss_history.append(avg_loss)
+    scheduler.step(avg_loss)
+
+    # 可视化
+    if (epoch + 1) % 20 == 0:
+        rnn.eval()
+        with torch.no_grad():
+            pred_viz, _ = rnn(x_test_viz)
+        rnn.train()
+
+        pred_np = pred_viz.cpu().numpy().flatten()
+
+        ax1.cla()
+        ax1.plot(test_steps_viz, y_test_viz, 'r-', linewidth=1.5, label='target (cos)')
+        ax1.plot(test_steps_viz, pred_np, 'b--', linewidth=1.5, label='prediction')
+        ax1.set_title(f'Epoch {epoch + 1}')
+        ax1.legend(loc='upper right')
+        ax1.set_ylim(-1.5, 1.5)
+
+        ax2.cla()
+        ax2.plot(loss_history, 'k-', linewidth=1)
+        ax2.set_title('Training Loss')
+        ax2.set_xlabel('Epoch')
+        ax2.set_ylabel('MSE')
+        ax2.set_yscale('log')
+        ax2.axhline(y=0.01, color='gray', linestyle=':', label='target: 0.01')
+        ax2.legend()
+
+        plt.pause(0.01)
+        print(f'Epoch {epoch + 1:3d}/{EPOCHS}, '
+              f'Loss: {avg_loss:.6f}, LR: {optimizer.param_groups[0]["lr"]:.5f}')
+
+# ================= 6. 最终评估 =================
+rnn.eval()
+with torch.no_grad():
+    x_test_full = torch.from_numpy(X_test).to(DEVICE)
+    y_test_full = torch.from_numpy(Y_test).to(DEVICE)
+    test_pred, _ = rnn(x_test_full)
+    test_loss = criterion(test_pred, y_test_full)
+
+    print(f'\n===== Done =====')
+    print(f'Final train Loss: {loss_history[-1]:.6f}')
+    print(f'Test Loss:         {test_loss.item():.6f}')
+
+plt.ioff()
+plt.show()
